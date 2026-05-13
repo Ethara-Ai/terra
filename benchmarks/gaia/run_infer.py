@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import tempfile
 import time
 import zipfile
@@ -10,6 +11,7 @@ from typing import Any, List, Sequence, cast
 import huggingface_hub
 import pandas as pd
 from datasets import DatasetDict, load_dataset
+from dotenv import load_dotenv
 from PIL import Image
 
 from benchmarks.gaia.config import INFER_DEFAULTS
@@ -32,7 +34,6 @@ from benchmarks.utils.critics import create_critic
 from benchmarks.utils.evaluation import Evaluation
 from benchmarks.utils.evaluation_utils import (
     construct_eval_output_dir,
-    generate_error_logs_summary,
     get_default_on_result_writer,
 )
 from benchmarks.utils.fake_user_response import run_conversation_with_fake_user_response
@@ -62,10 +63,20 @@ from openhands.tools.preset.default import get_default_tools
 from openhands.workspace import APIRemoteWorkspace
 
 
+load_dotenv()
+
 logger = get_logger(__name__)
 
 # Cache directory for GAIA dataset files
 DATASET_CACHE_DIR = Path(__file__).parent / "data"
+
+
+def _resolve_file_path(split: str, file_name: str) -> Path:
+    """Resolve attachment file path, checking nokor/ then 2023/ directories."""
+    nokor_path = DATASET_CACHE_DIR / "nokor" / split / file_name
+    if nokor_path.exists():
+        return nokor_path
+    return DATASET_CACHE_DIR / "2023" / split / file_name
 
 
 class GAIAEvaluation(Evaluation):
@@ -94,19 +105,36 @@ class GAIAEvaluation(Evaluation):
         logger.info(
             f"Loading GAIA dataset: {level}, split: {self.metadata.dataset_split}"
         )
-        dataset = cast(DatasetDict, load_dataset("gaia-benchmark/GAIA", level))
 
-        # Download dataset files
-        logger.info(f"Downloading GAIA dataset files to {DATASET_CACHE_DIR}")
-        DATASET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        huggingface_hub.snapshot_download(
-            "gaia-benchmark/GAIA",
-            repo_type="dataset",
-            local_dir=str(DATASET_CACHE_DIR),
-        )
+        # Check for local dataset path (CLI arg, env var, or local nokor directory)
+        local_dataset_path = None
+        if self.metadata.details and self.metadata.details.get("dataset_file"):
+            local_dataset_path = str(
+                Path(self.metadata.details["dataset_file"]).resolve()
+            )
+        if not local_dataset_path:
+            local_dataset_path = os.getenv("GAIA_LOCAL_DATASET_PATH")
 
-        # Convert to pandas and rename task_id to instance_id
-        df = cast(pd.DataFrame, dataset[self.metadata.dataset_split].to_pandas())
+        if local_dataset_path:
+            # Load from local JSONL file
+            logger.info(f"Loading local dataset from: {local_dataset_path}")
+            df = pd.read_json(local_dataset_path, lines=True)
+        else:
+            # Fallback to HuggingFace
+            dataset = cast(DatasetDict, load_dataset("gaia-benchmark/GAIA", level))
+
+            # Download dataset files
+            logger.info(f"Downloading GAIA dataset files to {DATASET_CACHE_DIR}")
+            DATASET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            huggingface_hub.snapshot_download(
+                "gaia-benchmark/GAIA",
+                repo_type="dataset",
+                local_dir=str(DATASET_CACHE_DIR),
+            )
+
+            # Convert to pandas
+            df = cast(pd.DataFrame, dataset[self.metadata.dataset_split].to_pandas())
+
         df.rename(columns={"task_id": "instance_id"}, inplace=True)
 
         # Filter completed instances
@@ -170,6 +198,13 @@ class GAIAEvaluation(Evaluation):
         logger.info(f"Preparing workspace for instance {instance.id}")
 
         if self.metadata.workspace_type == "docker":
+            # Use linux/arm64 on Apple Silicon Macs for native performance
+            import platform as _platform
+
+            docker_platform = (
+                "linux/arm64" if _platform.machine() == "arm64" else "linux/amd64"
+            )
+
             agent_server_image = (
                 f"{EVAL_AGENT_SERVER_IMAGE}:{IMAGE_TAG_PREFIX}-gaia-binary"
             )
@@ -178,6 +213,7 @@ class GAIAEvaluation(Evaluation):
                 base_image="nikolaik/python-nodejs:python3.12-nodejs22",
                 build_target="binary",
                 forward_env=forward_env,
+                platform=docker_platform,
             )
         elif self.metadata.workspace_type == "remote":
             # For workflow, use APIRemoteWorkspace with pre-built GAIA image
@@ -233,9 +269,7 @@ class GAIAEvaluation(Evaluation):
             assert self.metadata.details is not None
 
             # Construct source file path
-            src_file = (
-                DATASET_CACHE_DIR / "2023" / self.metadata.dataset_split / file_name
-            )
+            src_file = _resolve_file_path(self.metadata.dataset_split, file_name)
 
             if not src_file.exists():
                 logger.warning(f"Source file not found: {src_file}")
@@ -265,30 +299,20 @@ class GAIAEvaluation(Evaluation):
                         str(src_file), f"/workspace/file.{extension_name}"
                     )
 
-        # Install ffmpeg (some GAIA tasks need it)
+        # Install ffmpeg (needed for audio/video GAIA tasks)
         logger.info("Installing ffmpeg...")
-        # Note: ffprobe is part of the ffmpeg package, not a separate package
         result = workspace.execute_command(
-            "sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg"
+            "sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock"
+            " && sudo dpkg --configure -a"
+            " && sudo apt-get update -qq"
+            " && sudo apt-get install -y -qq --no-install-recommends ffmpeg",
+            timeout=300,
         )
         if result.exit_code != 0:
             logger.warning(f"Failed to install ffmpeg: {result.stderr}")
-            # Try alternative installation method
-            logger.info("Trying alternative ffmpeg installation...")
-            result = workspace.execute_command(
-                "sudo apt-get install -y -qq --no-install-recommends ffmpeg"
-            )
-            if result.exit_code == 0:
-                logger.info("✓ FFmpeg installed via alternative method")
-            else:
-                logger.error(f"FFmpeg installation failed completely: {result.stderr}")
-                # Continue anyway - only some tasks need it
+            logger.warning("Audio/video tasks may fail without ffmpeg")
         else:
             logger.info("✓ FFmpeg installed successfully")
-            # Verify installation
-            verify_result = workspace.execute_command("ffmpeg -version | head -1")
-            if verify_result.exit_code == 0:
-                logger.info(f"FFmpeg version: {verify_result.stdout.strip()}")
 
         return workspace
 
@@ -311,9 +335,7 @@ class GAIAEvaluation(Evaluation):
             if extension_name in ["jpg", "png", "jpeg"]:
                 # Load image and encode as base64
                 assert self.metadata.details is not None
-                src_file = (
-                    DATASET_CACHE_DIR / "2023" / self.metadata.dataset_split / file_name
-                )
+                src_file = _resolve_file_path(self.metadata.dataset_split, file_name)
                 if src_file.exists():
                     image = Image.open(src_file)
                     if extension_name in ["jpg", "jpeg"]:
@@ -468,9 +490,7 @@ Here is the task:
             extension_name = file_name.split(".")[-1].lower()
             if extension_name == "zip":
                 # List files from zip
-                src_file = (
-                    DATASET_CACHE_DIR / "2023" / self.metadata.dataset_split / file_name
-                )
+                src_file = _resolve_file_path(self.metadata.dataset_split, file_name)
                 if src_file.exists():
                     with zipfile.ZipFile(src_file, "r") as zip_ref:
                         filenames = [f"/workspace/{f}" for f in zip_ref.namelist()]
@@ -597,16 +617,217 @@ For example: if you want to search for a research paper on Arxiv, either use the
             return text  # Return raw text as fallback
 
 
+def _sanitize_model_name(name: str) -> str:
+    """Sanitize model name for use as a directory name."""
+    return name.replace(":", "_").replace("/", "_").replace(" ", "_")
+
+
+def _get_model_folder_name(llm: "Any") -> str:
+    """Get a clean folder name from the LLM config.
+
+    Uses model_canonical_name if available, otherwise falls back to model field.
+    """
+    name = getattr(llm, "model_canonical_name", None) or llm.model
+    return _sanitize_model_name(name)
+
+
+def _reorganize_outputs(
+    flat_output_dir: str,
+    final_base_dir: str,
+    model_folder: str,
+) -> list[str]:
+    """Reorganize flat evaluation outputs into per-instance/per-model structure.
+
+    Reads the output JSONL files and conversation archives from flat_output_dir,
+    then copies them into:
+        final_base_dir/{instance_id}/{model_folder}/
+
+    Returns list of reorganized instance directories.
+    """
+    reorganized: list[str] = []
+
+    output_file = os.path.join(flat_output_dir, "output.jsonl")
+    if not os.path.exists(output_file):
+        logger.warning(f"No output.jsonl found in {flat_output_dir}")
+        return reorganized
+
+    instance_results: dict[str, list[dict]] = {}
+    for fname in sorted(os.listdir(flat_output_dir)):
+        if fname.startswith("output.critic_attempt_") and fname.endswith(".jsonl"):
+            fpath = os.path.join(flat_output_dir, fname)
+            with open(fpath, "r") as f:
+                for line in f:
+                    if line.strip():
+                        data = json.loads(line)
+                        iid = data.get("instance_id", "unknown")
+                        instance_results.setdefault(iid, []).append(
+                            {"attempt_file": fname, "data": data}
+                        )
+
+    final_results: dict[str, dict] = {}
+    with open(output_file, "r") as f:
+        for line in f:
+            if line.strip():
+                data = json.loads(line)
+                iid = data.get("instance_id", "unknown")
+                final_results[iid] = data
+
+    for instance_id in set(list(instance_results.keys()) + list(final_results.keys())):
+        instance_dir = os.path.join(final_base_dir, instance_id, model_folder)
+        os.makedirs(instance_dir, exist_ok=True)
+
+        if instance_id in final_results:
+            out_path = os.path.join(instance_dir, "output.jsonl")
+            with open(out_path, "w") as f:
+                f.write(json.dumps(final_results[instance_id]) + "\n")
+
+        if instance_id in instance_results:
+            for entry in instance_results[instance_id]:
+                attempt_path = os.path.join(instance_dir, entry["attempt_file"])
+                with open(attempt_path, "a") as f:
+                    f.write(json.dumps(entry["data"]) + "\n")
+
+        conv_archive = os.path.join(
+            flat_output_dir, "conversations", f"{instance_id}.tar.gz"
+        )
+        if os.path.exists(conv_archive):
+            conv_dir = os.path.join(instance_dir, "conversations")
+            os.makedirs(conv_dir, exist_ok=True)
+            shutil.copy2(conv_archive, os.path.join(conv_dir, f"{instance_id}.tar.gz"))
+
+        for log_suffix in [".log", ".output.log"]:
+            log_src = os.path.join(
+                flat_output_dir, "logs", f"instance_{instance_id}{log_suffix}"
+            )
+            if os.path.exists(log_src):
+                log_dir = os.path.join(instance_dir, "logs")
+                os.makedirs(log_dir, exist_ok=True)
+                shutil.copy2(
+                    log_src,
+                    os.path.join(log_dir, f"instance_{instance_id}{log_suffix}"),
+                )
+
+        summary = _generate_instance_summary(
+            instance_id, instance_dir, conv_archive, final_results.get(instance_id)
+        )
+        if summary:
+            with open(os.path.join(instance_dir, "summary.json"), "w") as f:
+                json.dump(summary, f, indent=2)
+
+        metadata_src = os.path.join(flat_output_dir, "metadata.json")
+        if os.path.exists(metadata_src):
+            with open(metadata_src, "r") as f:
+                meta = json.loads(f.read())
+            meta["eval_output_dir"] = os.path.join(
+                "eval_outputs", instance_id, model_folder
+            )
+            with open(os.path.join(instance_dir, "metadata.json"), "w") as f:
+                json.dump(meta, f, indent=2)
+
+        reorganized.append(instance_dir)
+
+    return reorganized
+
+
+def _generate_instance_summary(
+    instance_id: str,
+    instance_dir: str,
+    conv_archive_path: str,
+    final_result: dict | None,
+) -> dict | None:
+    """Generate a summary.json for a single instance with cost/tokens/latency/score."""
+    import tarfile
+
+    summary: dict = {
+        "instance_id": instance_id,
+        "score": None,
+        "model_answer": None,
+        "ground_truth": None,
+        "cost": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "llm_calls": None,
+        "avg_latency_seconds": None,
+    }
+
+    if final_result:
+        test_result = final_result.get("test_result", {})
+        summary["score"] = test_result.get("score")
+        summary["model_answer"] = test_result.get("model_answer")
+        summary["ground_truth"] = test_result.get("ground_truth")
+
+    if os.path.exists(conv_archive_path):
+        try:
+            with tarfile.open(conv_archive_path, "r:gz") as tar:
+                for member in tar.getmembers():
+                    if member.name.endswith("base_state.json"):
+                        f = tar.extractfile(member)
+                        if f:
+                            state = json.loads(f.read().decode("utf-8"))
+                            stats = state.get("stats", {})
+                            usage = stats.get("usage_to_metrics", {})
+                            for _key, metrics in usage.items():
+                                summary["cost"] = metrics.get("accumulated_cost")
+                                token_usage = metrics.get("accumulated_token_usage", {})
+                                summary["prompt_tokens"] = token_usage.get(
+                                    "prompt_tokens"
+                                )
+                                summary["completion_tokens"] = token_usage.get(
+                                    "completion_tokens"
+                                )
+                                latencies = metrics.get("response_latencies", [])
+                                summary["llm_calls"] = len(latencies)
+                                if latencies:
+                                    total_lat = sum(
+                                        r.get("latency", 0) for r in latencies
+                                    )
+                                    summary["avg_latency_seconds"] = round(
+                                        total_lat / len(latencies), 2
+                                    )
+                                break
+                            break
+        except Exception as e:
+            logger.warning(f"Could not extract metrics from conversation archive: {e}")
+
+    return summary
+
+
 def main() -> None:
     """Main entry point for GAIA evaluation."""
+    # Ensure AWS credentials file is not used - we authenticate via api_key (Bearer token)
+    os.environ.pop("AWS_ACCESS_KEY_ID", None)
+    os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
+    os.environ.pop("AWS_SESSION_TOKEN", None)
+    os.environ["AWS_SHARED_CREDENTIALS_FILE"] = "/dev/null"
+
     parser = get_parser()
     parser.add_argument(
         "--level",
         type=str,
         help="GAIA level to evaluate (e.g., 2023_level1, 2023_level2, 2023_level3, 2023_all)",
     )
+    parser.add_argument(
+        "--dataset-file",
+        type=str,
+        help="Path to local JSONL dataset file (e.g., data/nokor/validation/custom_gaia_20.jsonl)",
+    )
+    parser.add_argument(
+        "--instance",
+        type=str,
+        help="Run a single instance by task_id (e.g., nokor_001)",
+    )
     parser.set_defaults(**INFER_DEFAULTS)
     args = parser.parse_args()
+
+    instance_select_file = None
+    if args.instance:
+        instance_select_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False
+        )
+        instance_select_file.write(args.instance + "\n")
+        instance_select_file.close()
+        args.select = instance_select_file.name
+        args.n_limit = 1
 
     # Create critic instance from parsed arguments
     critic = create_critic(args)
@@ -619,14 +840,16 @@ def main() -> None:
     llm = load_llm_config(args.llm_config_path)
     logger.info("Using LLM config: %s", llm.model_dump_json(indent=2))
 
-    # Construct dataset description
-    dataset_description = f"gaia-{args.level}-{args.split}"
+    model_folder = _get_model_folder_name(llm)
 
-    # Construct output directory
+    # Construct dataset description
+    dataset_description = f"{args.level}-{args.split}"
+
+    # Construct output directory (use .tmp for flat output, then reorganize)
     structured_output_dir = construct_eval_output_dir(
-        base_dir=args.output_dir,
+        base_dir=os.path.join(args.output_dir, ".tmp"),
         dataset_name=dataset_description,
-        model_name=llm.model,
+        model_name=model_folder,
         max_iterations=args.max_iterations,
         eval_note=args.note,
     )
@@ -638,7 +861,10 @@ def main() -> None:
         dataset_split=args.split,
         max_iterations=args.max_iterations,
         eval_output_dir=structured_output_dir,
-        details={"level": args.level},
+        details={
+            "level": args.level,
+            "dataset_file": getattr(args, "dataset_file", None),
+        },
         eval_limit=args.n_limit,
         n_critic_runs=args.n_critic_runs,
         critic=critic,
@@ -655,12 +881,29 @@ def main() -> None:
     # Run evaluation
     evaluator.run(on_result=get_default_on_result_writer(evaluator.output_path))
 
-    # Generate error logs summary for easy navigation
-    generate_error_logs_summary(structured_output_dir)
+    # Reorganize outputs into per-instance structure
+    logger.info("Reorganizing outputs into per-instance structure...")
+    final_base_dir = args.output_dir
+    reorganized = _reorganize_outputs(
+        structured_output_dir, final_base_dir, model_folder
+    )
+    logger.info(f"Reorganized {len(reorganized)} instance outputs to {final_base_dir}")
+
+    # Clean up temporary flat output
+    tmp_dir = os.path.join(args.output_dir, ".tmp")
+    if os.path.isdir(tmp_dir):
+        shutil.rmtree(tmp_dir)
+
+    if instance_select_file:
+        os.unlink(instance_select_file.name)
+
+    for inst_dir in reorganized:
+        rel_path = os.path.relpath(inst_dir, start=os.getcwd())
+        logger.info(f"  {rel_path}/")
 
     logger.info("Evaluation completed!")
-    logger.info(f"Results written to: {evaluator.output_path}")
-    print(json.dumps({"output_json": str(evaluator.output_path)}))
+    output_paths = [os.path.relpath(d, start=os.getcwd()) for d in reorganized]
+    print(json.dumps({"output_dirs": output_paths}))
 
 
 if __name__ == "__main__":

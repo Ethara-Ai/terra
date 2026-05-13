@@ -90,6 +90,7 @@ def create_docker_workspace(
     build_target: TargetType,
     working_dir: str = "/workspace",
     forward_env: list[str] | None = None,
+    platform: str | None = None,
 ) -> DockerWorkspace | DockerDevWorkspace:
     """Create a Docker workspace, building the image only if not already available.
 
@@ -117,6 +118,7 @@ def create_docker_workspace(
             working_dir=working_dir,
             target=build_target,
             forward_env=forward_env or [],
+            platform=platform,
         )
 
 

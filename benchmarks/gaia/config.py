@@ -15,9 +15,9 @@ CONDENSER_DEFAULTS = {
 
 # Inference defaults (used by run_infer.py)
 INFER_DEFAULTS = {
-    "dataset": "gaia-benchmark/GAIA",
+    "dataset": "ethara/Nokor",
     "split": "validation",
-    "level": "2023_all",
+    "level": "all",
     "num_workers": 30,
     **CONDENSER_DEFAULTS,
     "critic": "pass",
